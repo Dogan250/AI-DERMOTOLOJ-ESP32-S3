@@ -1,0 +1,45 @@
+# Gerekli kütüphaneleri kur (Colab'da tek hücreye yapıştırıp çalıştır)
+!pip install -q transformers torch pillow paho-mqtt
+
+from google.colab import files
+from PIL import Image
+from transformers import pipeline
+import paho.mqtt.publish as publish
+
+# 1. Hazır eğitilmiş cilt lezyonu sınıflandırma modelini yükle
+print("Yapay zeka modeli yükleniyor...")
+classifier = pipeline("image-classification", model="Anwarkh1/Skin_Cancer-Image_Classification")
+
+# 2. Bilgisayardan test edilecek cilt fotoğrafını seçiyoruz
+print("Lütfen analiz edilecek resmi yükleyin:")
+uploaded = files.upload()
+resim_adi = list(uploaded.keys())[0]
+img = Image.open(resim_adi)
+
+# 3. Resmi analiz ediyoruz
+sonuclar = classifier(img)
+en_yuksek = sonuclar[0]
+etiket = en_yuksek['label']
+oran = en_yuksek['score'] * 100
+
+# 4. İlgili cilt rahatsızlığı varsa veya yoksa kanser riskini yazıyoruz
+# Not: Türkçe karakter sorunu yaşamamk için ingilizce yazıyoruz. Oled ekranda bazen sorun çıkaibliyor.
+ceviriler = {
+    "melanoma": ("Melanom", "KANSER RISKI!"),
+    "basal_cell_carcinoma": ("Bazal Karsinom", "KANSER RISKI!"),
+    "squamous_cell_carcinoma": ("Skuamoz Kanser", "KANSER RISKI!"),
+    "melanocytic_Nevi": ("Normal Ben", "TEMIZ (BENIGN)"),
+    "benign_keratosis-like_lesions": ("Iyi Huylu Leke", "TEMIZ (BENIGN)"),
+    "actinic_keratoses": ("Aktinik Leke", "TAKIP GEREKLI"),
+    "vascular_lesions": ("Damar Lekesi", "TEMIZ (BENIGN)"),
+    "dermatofibroma": ("Sivilce / Nodul", "TEMIZ (BENIGN)")
+}
+
+tur, uyari = ceviriler.get(etiket, (" Sivilce / Leke", "TEMIZ (BENIGN)"))
+
+# 5. Elimizdeki veriyi  "Tür,Oran,Uyarı" formatında birleştirip ESP'ye gönderiyoruz
+mesaj = f"{tur};{oran:.1f};{uyari}"
+kanal_adi = "dogan_esp32_dermatoloji_2026"
+
+publish.single(kanal_adi, mesaj, hostname="broker.hivemq.com")
+print(f"\nAnaliz Tamamlandı! ESP32'ye gönderilen paket -> {mesaj}")
