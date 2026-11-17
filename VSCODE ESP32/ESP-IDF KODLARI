@@ -1,0 +1,330 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+
+// --- KENDİ WIFI BİLGİLERİNİ GİR ---
+#define WIFI_ADI      "TurkTelekom_TP9860"
+#define WIFI_SIFRESI  "MTm3rbxnVJ4v"
+
+#define MQTT_SUNUCU   "broker.hivemq.com"
+#define MQTT_PORT     "1883"
+#define MQTT_KANAL    "dogan_esp32_dermatoloji_2026"
+
+// OLED Pinleri (VCC -> 3V3, GND -> GND, SDA -> 17, SCL -> 18)
+#define OLED_SDA GPIO_NUM_17
+#define OLED_SCL GPIO_NUM_18
+#define OLED_ADRES 0x3C
+
+static const char *TAG = "AI_OLED";
+static uint8_t ekran_tamponu[128 * 8];
+static bool wifi_baglandi = false;
+
+// --- SAF GPIO I2C SÜRÜCÜSÜ ---
+static void i2c_gecikme(void) { esp_rom_delay_us(2); }
+
+static void i2c_basla(void) {
+    gpio_set_level(OLED_SDA, 1);
+    gpio_set_level(OLED_SCL, 1);
+    i2c_gecikme();
+    gpio_set_level(OLED_SDA, 0);
+    i2c_gecikme();
+    gpio_set_level(OLED_SCL, 0);
+}
+
+static void i2c_dur(void) {
+    gpio_set_level(OLED_SDA, 0);
+    gpio_set_level(OLED_SCL, 1);
+    i2c_gecikme();
+    gpio_set_level(OLED_SDA, 1);
+    i2c_gecikme();
+}
+
+static void i2c_byte_yaz(uint8_t veri) {
+    for (int i = 7; i >= 0; i--) {
+        gpio_set_level(OLED_SDA, (veri >> i) & 0x01);
+        i2c_gecikme();
+        gpio_set_level(OLED_SCL, 1);
+        i2c_gecikme();
+        gpio_set_level(OLED_SCL, 0);
+    }
+    gpio_set_level(OLED_SDA, 1);
+    i2c_gecikme();
+    gpio_set_level(OLED_SCL, 1);
+    i2c_gecikme();
+    gpio_set_level(OLED_SCL, 0);
+}
+
+static void oled_komut(uint8_t cmd) {
+    i2c_basla();
+    i2c_byte_yaz(OLED_ADRES << 1);
+    i2c_byte_yaz(0x00);
+    i2c_byte_yaz(cmd);
+    i2c_dur();
+}
+
+static void oled_baslat(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pin_bit_mask = (1ULL << OLED_SDA) | (1ULL << OLED_SCL),
+        .pull_down_en = 0,
+        .pull_up_en = 1,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(OLED_SDA, 1);
+    gpio_set_level(OLED_SCL, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    uint8_t baslangic_komutlari[] = {
+        0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40,
+        0x81, 0xFF, 0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
+        0x00, 0xD5, 0xF0, 0xD9, 0x22, 0xDA, 0x12, 0xDB,
+        0x20, 0x8D, 0x14, 0xAF
+    };
+    for (size_t i = 0; i < sizeof(baslangic_komutlari); i++) {
+        oled_komut(baslangic_komutlari[i]);
+    }
+}
+
+static void oled_temizle(void) {
+    memset(ekran_tamponu, 0, sizeof(ekran_tamponu));
+}
+
+static void oled_guncelle(void) {
+    for (uint8_t sayfa = 0; sayfa < 8; sayfa++) {
+        oled_komut(0xB0 + sayfa);
+        oled_komut(0x00);
+        oled_komut(0x10);
+
+        i2c_basla();
+        i2c_byte_yaz(OLED_ADRES << 1);
+        i2c_byte_yaz(0x40);
+        for (int i = 0; i < 128; i++) {
+            i2c_byte_yaz(ekran_tamponu[sayfa * 128 + i]);
+        }
+        i2c_dur();
+    }
+}
+
+typedef struct {
+    char sembol;
+    uint8_t sutun[5];
+} KarakterHaritasi;
+
+static const KarakterHaritasi harf_tablosu[] = {
+    {'A', {0x7E, 0x11, 0x11, 0x11, 0x7E}}, {'B', {0x7F, 0x49, 0x49, 0x49, 0x36}},
+    {'C', {0x3E, 0x41, 0x41, 0x41, 0x22}}, {'D', {0x7F, 0x41, 0x41, 0x22, 0x1C}},
+    {'E', {0x7F, 0x49, 0x49, 0x49, 0x41}}, {'F', {0x7F, 0x09, 0x09, 0x09, 0x01}},
+    {'G', {0x3E, 0x41, 0x49, 0x49, 0x7A}}, {'H', {0x7F, 0x08, 0x08, 0x08, 0x7F}},
+    {'I', {0x00, 0x41, 0x7F, 0x41, 0x00}}, {'J', {0x20, 0x40, 0x41, 0x3F, 0x01}},
+    {'K', {0x7F, 0x08, 0x14, 0x22, 0x41}}, {'L', {0x7F, 0x40, 0x40, 0x40, 0x40}},
+    {'M', {0x7F, 0x02, 0x0C, 0x02, 0x7F}}, {'N', {0x7F, 0x04, 0x08, 0x10, 0x7F}},
+    {'O', {0x3E, 0x41, 0x41, 0x41, 0x3E}}, {'P', {0x7F, 0x09, 0x09, 0x09, 0x06}},
+    {'R', {0x7F, 0x09, 0x19, 0x29, 0x46}}, {'S', {0x46, 0x49, 0x49, 0x49, 0x31}},
+    {'T', {0x01, 0x01, 0x7F, 0x01, 0x01}}, {'U', {0x3F, 0x40, 0x40, 0x40, 0x3F}},
+    {'V', {0x1F, 0x20, 0x40, 0x20, 0x1F}}, {'Y', {0x07, 0x08, 0x70, 0x08, 0x07}},
+    {'Z', {0x61, 0x51, 0x49, 0x45, 0x43}}, {'0', {0x3E, 0x51, 0x49, 0x45, 0x3E}},
+    {'1', {0x00, 0x42, 0x7F, 0x40, 0x00}}, {'2', {0x42, 0x61, 0x51, 0x49, 0x46}},
+    {'3', {0x21, 0x41, 0x45, 0x4B, 0x31}}, {'4', {0x18, 0x14, 0x12, 0x7F, 0x10}},
+    {'5', {0x27, 0x45, 0x45, 0x45, 0x39}}, {'6', {0x3C, 0x4A, 0x49, 0x49, 0x30}},
+    {'7', {0x01, 0x71, 0x09, 0x05, 0x03}}, {'8', {0x36, 0x49, 0x49, 0x49, 0x36}},
+    {'9', {0x06, 0x49, 0x49, 0x29, 0x1E}}, {'%', {0x23, 0x13, 0x08, 0x64, 0x62}},
+    {'.', {0x00, 0x60, 0x60, 0x00, 0x00}}, {'!', {0x00, 0x00, 0x5F, 0x00, 0x00}},
+    {'-', {0x08, 0x08, 0x08, 0x08, 0x08}}, {'/', {0x20, 0x10, 0x08, 0x04, 0x02}},
+    {'(', {0x00, 0x1C, 0x22, 0x41, 0x00}}, {')', {0x00, 0x41, 0x22, 0x1C, 0x00}},
+    {':', {0x00, 0x36, 0x36, 0x00, 0x00}}
+};
+
+static void oled_yazi_yaz(uint8_t satir, uint8_t x, const char *metin) {
+    if (satir >= 8) return;
+    while (*metin && x <= 122) {
+        char c = *metin++;
+        if (c >= 'a' && c <= 'z') c -= 32;
+
+        uint8_t desen[5] = {0, 0, 0, 0, 0};
+        for (size_t i = 0; i < sizeof(harf_tablosu) / sizeof(harf_tablosu[0]); i++) {
+            if (harf_tablosu[i].sembol == c) {
+                memcpy(desen, harf_tablosu[i].sutun, 5);
+                break;
+            }
+        }
+        for (uint8_t k = 0; k < 5; k++) {
+            ekran_tamponu[satir * 128 + x + k] = desen[k];
+        }
+        x += 6;
+    }
+}
+
+static void oled_bar_ciz(float yuzde) {
+    if (yuzde < 0) yuzde = 0;
+    if (yuzde > 100) yuzde = 100;
+    uint8_t doluluk = (uint8_t)((yuzde * 120.0f) / 100.0f);
+
+    for (uint8_t x = 4; x < 124; x++) {
+        ekran_tamponu[7 * 128 + x] = (x - 4 < doluluk) ? 0xFF : 0x81;
+    }
+}
+
+static void sonucu_ekrana_bas(const char *tur, float oran, const char *uyari) {
+    char oran_metni[32];
+    snprintf(oran_metni, sizeof(oran_metni), "OLASILIK: %%%.1f", oran);
+
+    oled_temizle();
+    oled_yazi_yaz(0, 0, "AI DERMATOLOJI");
+    oled_yazi_yaz(2, 0, tur);
+    oled_yazi_yaz(4, 0, oran_metni);
+    oled_yazi_yaz(5, 0, uyari);
+    oled_bar_ciz(oran);
+    oled_guncelle();
+}
+
+// --- HARİCİ KÜTÜPHANESİZ SAF TCP SOKET MQTT DİNLEYİCİSİ ---
+static void mqtt_tcp_gorevi(void *pvParameters) {
+    uint8_t rx_buf[256];
+
+    while (1) {
+        if (!wifi_baglandi) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(MQTT_SUNUCU, MQTT_PORT, &hints, &res) != 0 || res == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        int sock = socket(res->ai_family, res->ai_socktype, 0);
+        if (sock < 0) {
+            freeaddrinfo(res);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+            close(sock);
+            freeaddrinfo(res);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        freeaddrinfo(res);
+
+        // 1. MQTT CONNECT Paketi Gönder
+        uint8_t connect_pkt[] = {
+            0x10, 0x19, 0x00, 0x04, 'M', 'Q', 'T', 'T',
+            0x04, 0x02, 0x00, 0x3C, 0x00, 0x0D,
+            'e','s','p','3','2','s','3','_','d','o','g','a','n'
+        };
+        send(sock, connect_pkt, sizeof(connect_pkt), 0);
+        recv(sock, rx_buf, sizeof(rx_buf), 0);
+
+        // 2. MQTT SUBSCRIBE Paketi Gönder ("dogan_esp32_dermatoloji_2026")
+        uint8_t sub_pkt[64];
+        size_t kanal_uzunluk = strlen(MQTT_KANAL);
+        sub_pkt[0] = 0x82;
+        sub_pkt[1] = (uint8_t)(2 + 2 + kanal_uzunluk + 1);
+        sub_pkt[2] = 0x00;
+        sub_pkt[3] = 0x01;
+        sub_pkt[4] = 0x00;
+        sub_pkt[5] = (uint8_t)kanal_uzunluk;
+        memcpy(&sub_pkt[6], MQTT_KANAL, kanal_uzunluk);
+        sub_pkt[6 + kanal_uzunluk] = 0x00;
+        send(sock, sub_pkt, 7 + kanal_uzunluk, 0);
+
+        oled_temizle();
+        oled_yazi_yaz(2, 0, "BAGLANTI HAZIR!");
+        oled_yazi_yaz(4, 0, "COLAB BEKLENIYOR");
+        oled_guncelle();
+        ESP_LOGI(TAG, "Sunucuya baglandi, Colab verisi bekleniyor...");
+
+        struct timeval tv = { .tv_sec = 20, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        while (1) {
+            int len = recv(sock, rx_buf, sizeof(rx_buf) - 1, 0);
+            if (len < 0) {
+                // Bağlantıyı canlı tutmak için PINGREQ gönder
+                uint8_t ping_pkt[] = {0xC0, 0x00};
+                if (send(sock, ping_pkt, 2, 0) < 0) break;
+                continue;
+            }
+            if (len == 0) break;
+
+            // Gelen paket PUBLISH (0x30) ise mesajı ayıkla
+            if ((rx_buf[0] & 0xF0) == 0x30 && len > 4) {
+                uint16_t t_len = (rx_buf[2] << 8) | rx_buf[3];
+                int veri_baslangic = 4 + t_len;
+                if (veri_baslangic < len) {
+                    int veri_boy = len - veri_baslangic;
+                    char gelen[128] = {0};
+                    if (veri_boy > 127) veri_boy = 127;
+                    memcpy(gelen, &rx_buf[veri_baslangic], veri_boy);
+
+                    ESP_LOGI(TAG, "Colab Verisi: %s", gelen);
+                    char *tur = strtok(gelen, ";");
+                    char *oran_str = strtok(NULL, ";");
+                    char *uyari = strtok(NULL, ";");
+
+                    if (tur && oran_str && uyari) {
+                        sonucu_ekrana_bas(tur, strtof(oran_str, NULL), uyari);
+                    }
+                }
+            }
+        }
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void wifi_olay_yoneticisi(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_baglandi = false;
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        wifi_baglandi = true;
+    }
+}
+
+void app_main(void) {
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    oled_baslat();
+    oled_temizle();
+    oled_yazi_yaz(2, 0, "WIFI BAGLANIYOR");
+    oled_guncelle();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_olay_yoneticisi, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_olay_yoneticisi, NULL);
+
+    wifi_config_t wifi_ayar = {
+        .sta = {
+            .ssid = WIFI_ADI,
+            .password = WIFI_SIFRESI,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_ayar);
+    esp_wifi_start();
+
+    xTaskCreate(mqtt_tcp_gorevi, "mqtt_tcp", 4096, NULL, 5, NULL);
+}
